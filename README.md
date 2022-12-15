@@ -1,2 +1,2 @@
-# kalmann_filter
-Implementation of a kalmann filter for a mobile robot
+# kalman_filter
+Implementation of a kalman filter for a mobile robot and visualized in gazebo
