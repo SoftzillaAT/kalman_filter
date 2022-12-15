@@ -1,0 +1,26 @@
+<launch>
+  <arg name="cfg" default="particle_filter" />
+  <arg name="map" default="cave" />
+  <arg name="plot_data" default="true" />
+  <arg name="mode" default="1" />
+  <!-- <arg name="initial_with_ground_truth" default="false" />
+  <arg name="reinitialize" default="true" />
+  <arg name="particle_filter/initial_distribution" default="1" />
+  <arg name="particle_filter/forward_prediction_time" default="0" />
+  <arg name="particle_filter/enable_update" default="false" />
+  <arg name="particle_filter/enable_resample" default="false" />
+  <arg name="particle_filter/enable_weighting" default="true" />
+  <arg name="particle_filter/sigma_init_position" default="0" />
+  <arg name="particle_filter/sigma_init_orientation" default="0" />
+  <arg name="particle_filter/sigma_static_postion" default="0" />
+  <arg name="particle_filter/sigma_static_orientation" default="0" />
+  -->
+  <node pkg="tuw_self_localization" type="tuw_self_localization_node" name="self_localization" output="screen">
+    <rosparam file="$(find tuw_self_localization)/cfg/particle_filter.yaml" command="load"/>
+    <param name="map_image" value="$(find tuw_self_localization)/maps/$(arg map).png" />
+    <param name="map_lines" value="$(find tuw_self_localization)/maps/$(arg map).yml" />
+    <remap from="scan" to="base_scan" />
+    <remap from="cmd" to="cmd_vel" />
+    <remap from="odom" to="odom" />
+  </node>
+</launch>

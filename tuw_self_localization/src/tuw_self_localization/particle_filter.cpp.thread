@@ -1,0 +1,392 @@
+#include <tuw_self_localization/particle_filter.h>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <boost/math/distributions/normal.hpp> // for normal_distribution
+#include <random>
+#include <iostream>
+#include <thread>
+
+using namespace tuw;
+
+std::random_device ParticleFilter::rd_;
+std::mt19937 ParticleFilter::generator_ ( rd_() );
+std::uniform_real_distribution<double> ParticleFilter::uniform_distribution_x_;
+std::uniform_real_distribution<double> ParticleFilter::uniform_distribution_y_;
+std::uniform_real_distribution<double> ParticleFilter::uniform_distribution_theta_;
+std::normal_distribution<double> ParticleFilter::normal_distribution_;
+
+ParticleFilter::ParticleFilter() :PoseFilter ( PARTICLE_FILTER ) {
+    normal_distribution_ = std::normal_distribution<double> ();
+    sigma_likelihood_field_ = 1.0;
+}
+SamplePtr& ParticleFilter::normal ( SamplePtr &sample, const Pose2D &mean, double sigma_position, double sigma_orientation ) const {
+    sample->set ( mean.x() + normal_distribution_ ( generator_ ) * sigma_position, mean.y() + normal_distribution_ ( generator_ ) * sigma_position, mean.theta() + normal_distribution_ ( generator_ ) * sigma_orientation );
+    sample->normalizeOrientation();
+    return sample;
+}
+
+SamplePtr& ParticleFilter::uniform ( SamplePtr &sample, std::uniform_real_distribution<double> distribution_x, std::uniform_real_distribution<double> distribution_y, std::uniform_real_distribution<double> distribution_theta ) const {
+    sample->set ( distribution_x ( generator_ ),  distribution_y ( generator_ ),  distribution_theta ( generator_ ) );
+    return sample;
+}
+void ParticleFilter::init ( ) {
+    samples.resize ( config_.nr_of_samples );
+    switch ( config_.initial_distribution ) {
+    case NORMAL_DISTRIBUTION:
+        initNormal ();
+        break;
+    case UNIFORM_DISTRIBUTION:
+        initUniform();
+        break;
+    case GRID_DISTRIBUTION:
+        initGrid();
+        break;
+    default:
+        initUniform();
+    };
+    reset_ = false;
+}
+
+void ParticleFilter::initNormal () {
+    for ( SamplePtr &s: samples ) {
+        s = std::make_shared<Sample>();
+        normal ( s, pose_init_, config_.sigma_init_position, config_.sigma_init_orientation );
+    }
+}
+
+void ParticleFilter::initUniform () {
+    for ( SamplePtr &s: samples ) {
+        s = std::make_shared<Sample>();
+        uniform ( s, uniform_distribution_x_, uniform_distribution_y_, uniform_distribution_theta_ );
+    }
+}
+
+void ParticleFilter::reinitialize ( const Pose2D &p ) {
+    setPoseInit ( p );
+    config_.initial_distribution = NORMAL_DISTRIBUTION;
+    reset_ = true;
+}
+
+void ParticleFilter::initGrid () {
+    float angle_division = 16;
+    samples.resize ( config_.nr_of_samples,  std::make_shared<Sample>() );
+    int i = 0;
+    double samples_per_angle = config_.nr_of_samples / angle_division;
+    double A = ( max_x_ - min_x_ ) * ( max_y_ - min_y_ );
+    double samples_per_m2 = samples_per_angle / A ;
+    double d =  1.0 / sqrt ( samples_per_m2 );
+    for ( double x = min_x_ + d/2.; x < max_x_; x+=d ) {
+        for ( double y = min_y_ + d/2.; y < max_y_; y+=d ) {
+            for ( double theta = -M_PI; theta < M_PI; theta += ( 2.*M_PI ) / angle_division ) {
+                if ( i  < config_.nr_of_samples ) {
+                    samples[i] = std::make_shared<Sample>();
+                    samples[i]->set ( x,y,theta );
+                    samples[i]->idx() = i;
+                    i++;
+                } else {
+                    std::cout << config_.nr_of_samples<< " : " << i;
+                }
+            }
+        }
+    }
+
+}
+
+
+void ParticleFilter::update ( const Command &u ) {
+
+    boost::posix_time::time_duration duration = duration_last_update_ + boost::posix_time::millisec ( config_.forward_prediction_time * 1000 );
+
+
+    double dx, dy, dtheta, dt = duration.total_microseconds() /1000000.;
+    ROS_INFO("duration: %f", dt);
+    for ( SamplePtr s : samples ) {
+        /**
+        * @ToDo MotionModel
+        * implement the forward sample_motion_velocity alogrithm and be aware that w can be zero!!
+	* use the config_.alpha1 - config_.alpha6 as noise parameters
+        **/
+        double v1 = u.v() + sample( config_.alpha1 * u.v() * u.v() + config_.alpha2 * u.w() * u.w() );  
+        double w1 = u.w() + sample( config_.alpha3 * u.v() * u.v() + config_.alpha4 * u.w() * u.w() );  
+        double gamma1 = sample( config_.alpha5 * u.v() * u.v() + config_.alpha6 * u.w() * u.w() );
+
+        //ROS_INFO("v: %f, v1: %f, w: %f, w1: %f", u.v(), v1, u.w(), w1);
+        double theta = s->theta(); //atan2( s->y(), s->x() );
+        if(w1 == 0)
+            w1 = 0.0000001;
+        dx = -(v1/w1) * sin(theta) + (v1/w1) * sin(theta + w1*dt);
+        dy = +(v1/w1) * cos(theta) - (v1/w1) * cos(theta + w1*dt);
+        dtheta = w1*dt + gamma1*dt;
+
+        s->x() = s->x() + dx;
+        s->y() = s->y() + dy;
+        s->theta() = s->theta() + dtheta;
+        //ROS_INFO("weight %f", s->weight()); 
+    }
+}
+
+double ParticleFilter::sample (double val ) {
+    std::normal_distribution<double> d(0, val);
+    double tmp = d(generator_);
+    return tmp;
+}
+
+
+Pose2D ParticleFilter::localization ( const Command &u, const MeasurementConstPtr &z ) {
+    if ( updateTimestamp ( z->stamp() ) ) {
+        updateLikelihoodField ();
+        if ( reset_ ) init();
+        if ( config_.enable_resample ) resample();
+        if ( config_.enable_update ) update ( u );
+        if ( config_.enable_weighting ) weighting ( ( const MeasurementLaserConstPtr& ) z );
+        pose_estimated_ = *samples[0];
+    }
+    return pose_estimated_;
+
+}
+void ParticleFilter::plotData ( Figure &figure_map ) {
+
+    /**
+    * @ToDo SensorModel
+    * plot the likelihood_field_ into figure_map.background()
+    **/
+    figure_map.setView(figure_map.background());
+    for ( int r = 0; r < likelihood_field_.rows; r++ ) {
+        for ( int c = 0; c < likelihood_field_.cols; c++ ) {
+            /// your code
+            float value = likelihood_field_.at<float>(r,c);
+            //ROS_INFO("val: %f", value);
+            if (value > 0.3)
+                 cv::circle(figure_map.background(), Point2D(c,r).cv(), 1, cv::Scalar(255 - 255*value*value, 255, 255));
+            //figure_map.symbol(figure_map.background(), figure_map.m2w(Point2D(c,r)), 0.1 * value * value, Figure::yellow, 0.01);
+            //if (value > 0.3)
+            //    figure_map.symbol(figure_map.background(), figure_map.m2w(Point2D(c,r)), Figure::yellow);
+        }
+    } 
+    
+ 
+
+    double scale =  255.0 / samples_weight_max_ ;
+    char text[0xFF];
+    for ( int i = samples.size()-1; i >= 0; i-- ) {
+        const SamplePtr &s = samples[i];
+        /**
+        * @ToDo MotionModel
+        * plot all samples use figure_map.symbol(....
+        **/
+        float norm_weight = s->weight() / samples_weight_max_; 
+        ////ROS_INFO("Weight: %f", s->weight());
+        if (norm_weight > 0.1)
+            figure_map.symbol(s->position(), 0.1, cv::Scalar(0, 255 - 255 * norm_weight*norm_weight, 255*norm_weight*norm_weight), 0.01);
+
+    }
+    sprintf ( text, "%4.3fsec", duration_last_update_.total_microseconds() /1000000. );
+    cv::putText ( figure_map.view(), text, cv::Point ( figure_map.view().cols-100,20 ), cv::FONT_HERSHEY_PLAIN, 1, Figure::white,3, CV_AA );
+    cv::putText ( figure_map.view(), text, cv::Point ( figure_map.view().cols-100,20 ), cv::FONT_HERSHEY_PLAIN, 1, Figure::black,1, CV_AA );
+
+    figure_map.symbol ( pose_estimated_, 0.5, Figure::magenta, 1 );
+}
+
+void ParticleFilter::setConfig ( const void *config ) {
+    config_ = * ( ( tuw_self_localization::ParticleFilterConfig* ) config );
+}
+void ParticleFilter::loadMap ( int width_pixel, int height_pixel, double min_x, double max_x, double min_y, double max_y, double roation, const std::string &file ) {
+    width_pixel_ = width_pixel,   height_pixel_ = height_pixel;
+    min_y_ = min_y, max_y_ = max_y, min_x_ = min_x, max_x_ = max_x, roation_ = roation;
+    double dx = max_x_ - min_x_;
+    double dy = max_y_ - min_y_;
+    double sy = height_pixel / dx;
+    double sx = width_pixel  / dy;
+    double oy = height_pixel / 2.0;
+    double ox = width_pixel  / 2.0;
+    double ca = cos ( roation ), sa = sin ( roation );
+    if ( sy == sy ) scale_ = sy;
+    else {
+        std::cerr << "loadMap: nonsymetric scale!";
+        return;
+    }
+    double owx = min_x_ + dx/2.;
+    double owy = min_y_ + dy/2.;
+    cv::Matx<double, 3, 3 > Tw ( 1, 0, -owx, 0, 1, -owy, 0, 0, 1 ); // translation
+    cv::Matx<double, 3, 3 > Sc ( sx, 0, 0, 0, sy, 0, 0, 0, 1 ); // scaling
+    cv::Matx<double, 3, 3 > Sp ( -1, 0, 0, 0, 1, 0, 0, 0, 1 );  // mirroring
+    cv::Matx<double, 3, 3 > R ( ca, -sa, 0, sa, ca, 0, 0, 0, 1 ); // rotation
+    cv::Matx<double, 3, 3 > Tm ( 1, 0, ox, 0, 1, oy, 0, 0, 1 ); // translation
+    tf_ = Tm * R * Sp * Sc * Tw;
+
+    map_.create ( height_pixel_, width_pixel_ );
+    distance_field_pixel_.create ( height_pixel_, width_pixel_ );
+    likelihood_field_.create ( height_pixel_, width_pixel_ );
+    cv::Mat image = cv::imread ( file, CV_LOAD_IMAGE_GRAYSCALE );
+    cv::resize ( image, map_, cv::Size ( map_.cols, map_.rows ), cv::INTER_AREA );
+
+    uniform_distribution_x_ =  std::uniform_real_distribution<double> ( min_x_, max_x_ );
+    uniform_distribution_y_ = std::uniform_real_distribution<double> ( min_y_, max_y_ );
+    uniform_distribution_theta_ = std::uniform_real_distribution<double> ( -M_PI, M_PI );
+
+    updateLikelihoodField ();
+}
+void ParticleFilter::updateLikelihoodField () {
+
+    if ( sigma_likelihood_field_ == config_.sigma_hit ) return;
+    sigma_likelihood_field_ = config_.sigma_hit;
+    boost::math::normal normal_likelihood_field = boost::math::normal ( 0, config_.sigma_hit );
+
+    /**
+    * @ToDo SensorModel
+    * using the cv::distanceTransform and the boost::math::pdf  
+    **/
+    cv::distanceTransform(map_, distance_field_pixel_, CV_DIST_L2, 3);  
+    ROS_INFO("Scale: %f", scale_);
+   
+    float max_val = boost::math::pdf(normal_likelihood_field, 0);
+
+    for (int r = 0; r < likelihood_field_.rows; r++) {
+        for (int c = 0; c < likelihood_field_.cols; c++) {
+            float scaled_distance = distance_field_pixel_.at<float>(r, c) / scale_;
+            likelihood_field_.at<float>(r, c) = boost::math::pdf(normal_likelihood_field, scaled_distance) / max_val;
+        
+            //ROS_INFO("Distance [%d, %d]: %f->%f->%f",r,c, distance_field_pixel_.at<float>(r,c), scaled_distance, likelihood_field_.at<float>(r,c));
+        }
+    }
+}
+
+void /*ParticleFilter::*/weight_sample(const SamplePtr &s, const MeasurementLaserConstPtr &z, cv::Mat likelihood_field_, double z_hit, double z_rand, cv::Matx33d tf_, std::vector<size_t> used_beams )  {
+  float q = 1;
+        for(int i = 0; i < used_beams.size(); i++) {
+            int index = used_beams[i];
+            const MeasurementLaser::Beam &beam = z->operator[] (index);
+            
+            if (beam.valid && beam.length != z->range_max()) {
+                
+                // Add also the distance from the robot to the sensor;
+                Point2D beam_point = z->tf() * beam.end_point;
+                float x_k = beam_point.x()/2;
+                float y_k = beam_point.y()/2;
+                float theta_k = beam.angle;
+                float z_k = sqrt(x_k*x_k + y_k*y_k); //beam.length/2;
+               
+                //ROS_INFO("Beam: Angle:%f, L_sens:%f, L_calc:%f", beam.angle, beam.length, z_k);
+                float theta = s->theta();
+                float x = s->x() + x_k * cos(theta) - y_k * sin(theta) + z_k * cos(theta + theta_k);
+                float y = s->y() + y_k * cos(theta) + x_k * sin(theta) + z_k * sin(theta + theta_k);
+                
+                Point2D sample_point = tf_  * Point2D(x, y);
+                
+                int index_x = (int)round(sample_point.x());
+                int index_y = (int)round(sample_point.y());
+                
+                //ROS_INFO("x:%f, y:%f, index_x:%d, index_y:%d", x,y,index_x,index_y);
+                //ROS_INFO("length: %f, angle %f", z_k, theta_k);
+                // if a index is out of the likelihood field, set it to zero
+                float likelihood = 0;
+
+                if (index_x >= 0 && index_x < likelihood_field_.cols && 
+                    index_y >= 0 && index_y < likelihood_field_.rows) {
+                    likelihood = likelihood_field_.at<float>(index_y, index_x);
+                }
+
+                if (likelihood > 1) 
+                    ROS_INFO("Invalid value in likelihood: %f", likelihood);
+                
+
+                q = q * (z_hit * likelihood + z_rand / z->range_max());
+            }
+        }
+        //ROS_INFO("Q-Value: %f", q);
+        s->weight() = q; 
+}
+
+void ParticleFilter::weighting ( const MeasurementLaserConstPtr &z ) {
+
+
+    if ( config_.nr_of_beams >  z->size() ) config_.nr_of_beams = z->size();
+    std::vector<size_t> used_beams ( config_.nr_of_beams );
+    /**
+    * @ToDo SensorModel
+    * the used_beams should define the index of used laser beams
+    **/
+    if ( config_.random_beams )  {
+        /**
+        * @ToDo SensorModel
+        * select random beams indexes
+        **/
+        
+        for (int i = 0; i < config_.nr_of_beams; i++){
+            int val = rand() % z->size();
+            
+            // if value exists count up to a value which not exists
+            while(std::find(used_beams.begin(), used_beams.end(), val) == used_beams.end()) {
+                val = (val + 1) % z->size();
+            }
+            used_beams.push_back(val);
+        }
+
+    } else {
+        /**
+        * @ToDo SensorModel
+        * select equlay distributed beams indexes
+        **/
+        float step_size = z->size() / config_.nr_of_beams;
+        float index = 0;
+        for(int i = 0; i < config_.nr_of_beams; i++) {
+            used_beams.push_back((int)floor(index));
+            index += step_size;
+        }
+    }
+
+
+    double samples_weight_sum = 0;
+  
+
+    std::vector<std::thread*> used_thread ( samples.size() );
+    for ( size_t idx = 0; idx < samples.size(); idx++ ) {
+        SamplePtr &s = samples[idx];
+        /**
+        * @ToDo SensorModel
+        * compute the weight for each particle
+        **/
+
+        std::thread *t1 = new std::thread(/*&ParticleFilter::*/weight_sample, s, z,likelihood_field_, config_.z_hit, config_.z_rand, tf_, used_beams);
+        used_thread.push_back(t1);
+    }
+
+    for ( size_t idx = 0; idx < samples.size(); idx++ ) {
+        SamplePtr &s = samples[idx];
+    
+        //used_thread[idx]->join();
+      
+        samples_weight_sum += s->weight();
+    }
+    
+    /// sort and normalize particles weights
+    std::sort ( samples.begin(),  samples.end(), Sample::greater ); 
+    samples_weight_max_ = 0;
+    for ( size_t i = 0; i < samples.size(); i++ ) {
+        SamplePtr &s = samples[i];
+        s->weight() /= samples_weight_sum;
+        s->idx() = i;
+        if ( samples_weight_max_ < s->weight() ) samples_weight_max_ = s->weight();
+    }
+}
+
+void ParticleFilter::resample () {
+    double dt = duration_last_update_.total_microseconds() /1000000.;
+    std::uniform_real_distribution<double> d ( 0,1 );
+    std::uniform_int_distribution<size_t>  uniform_idx_des ( 0,samples.size()-1 );
+    /**
+    * @ToDo Resample
+    * implement a resample weel
+    **/
+    
+    /// update number of samples
+    if ( config_.nr_of_samples < samples.size() ) samples.resize ( config_.nr_of_samples );
+    while ( config_.nr_of_samples > samples.size() ) {
+        double p = d ( generator_ );
+        size_t j = 0;
+	j = rand() % samples.size();
+        samples.push_back ( std::make_shared<Sample> ( *samples[j] ) );
+        SamplePtr &s  = samples.back();
+        normal ( s, *s, config_.sigma_static_position*dt, config_.sigma_static_orientation*dt );
+    }
+}

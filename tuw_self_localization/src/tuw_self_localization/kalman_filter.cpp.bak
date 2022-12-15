@@ -1,0 +1,26 @@
+#include "tuw_self_localization/kalman_filter.h"
+#include <boost/lexical_cast.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <tuw_geometry/linesegment2d_detector.h>
+#include <iostream>
+using namespace tuw;
+KalmanFilter::KalmanFilter()
+    : PoseFilter ( KALMAN_FILTER )
+    , figure_hspace_ ( "Hough Space" ) {
+}
+void KalmanFilter::init ( ) {}
+void KalmanFilter::detect_lines ( const MeasurementLaserConstPtr &z ) {}
+void KalmanFilter::plotData ( Figure &figure_map ) {}
+void KalmanFilter::plotMap ( Figure &figure_map ) {}
+void KalmanFilter::plotHoughSpace ( ) {}
+void KalmanFilter::data_association ( ) {}
+void KalmanFilter::reinitialize ( const Pose2D &p ) {}
+void KalmanFilter::loadMap ( int width_pixel, int height_pixel, double min_y, double max_y, double min_x, double max_x, double roation, const std::string &file ) {}
+Pose2D KalmanFilter::localization ( const Command &u, const MeasurementConstPtr &z ) {
+  return Pose2D();
+}
+void KalmanFilter::setConfig ( const void *config ) {    
+  config_ = * ( ( tuw_self_localization::KalmanFilterConfig* ) config );
+}
+void KalmanFilter::prediction ( const Command &u ) {}
+void KalmanFilter::correction () {}
